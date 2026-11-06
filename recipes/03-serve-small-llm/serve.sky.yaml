@@ -1,0 +1,46 @@
+# Recipe 03 - serve a small LLM (Qwen/Qwen3.5-4B) with vLLM on spot.
+#
+# A SkyServe service: one spot GPU replica running vLLM's OpenAI-compatible API,
+# cheapest-first across g7e / g6 / g5, with an on-demand replica as a preemption
+# safety net. SkyServe gives you one stable endpoint and load-balances replicas.
+#
+# Deploy:
+#   sky serve up -n qwen recipes/03-serve-small-llm/serve.sky.yaml
+#   sky serve status qwen          # wait for a READY replica + the endpoint
+#   sky serve logs qwen 1          # replica logs
+
+name: skyspot-serve-qwen
+
+service:
+  # vLLM answers GET /v1/models once the model is loaded -> replica is READY.
+  readiness_probe: /v1/models
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 1
+    # Spot-first: run the replica on spot, and only fall back to on-demand if
+    # spot capacity cannot be provisioned. Set false for pure spot.
+    # (To autoscale instead of a fixed count, raise max_replicas AND set
+    #  target_qps_per_replica.)
+    dynamic_ondemand_fallback: true
+
+resources:
+  accelerators: {RTXPRO6000:1, L4:1, A10G:1}
+  use_spot: true
+  max_hourly_cost: 2.0
+  ports: 8000
+  any_of:
+    - {cloud: aws, region: eu-north-1}
+    - {cloud: aws, region: ap-south-1}
+    - {cloud: aws, region: us-east-1}
+
+envs:
+  MODEL_NAME: Qwen/Qwen3.5-4B
+  # HF_TOKEN: <your token>   # only if the model is gated
+
+setup: |
+  pip install -q vllm
+
+run: |
+  vllm serve $MODEL_NAME \
+    --host 0.0.0.0 --port 8000 \
+    --tensor-parallel-size $SKYPILOT_NUM_GPUS_PER_NODE

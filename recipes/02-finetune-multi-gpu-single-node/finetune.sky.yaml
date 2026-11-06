@@ -1,0 +1,76 @@
+# Recipe 02 - multi-GPU, single-node fine-tune on spot.
+#
+# One 8-GPU instance (g7e.48xlarge / g6.48xlarge / g5.48xlarge), cheapest-first,
+# price-capped, region failover. All 8 GPUs are on the SAME physical node, so
+# they are inherently co-located (NVLink/PCIe) - no cross-node network to worry
+# about. (Cross-node "same spine" placement is recipe 04.)
+#
+# Launch:
+#   sky jobs launch -n ft-multi recipes/02-finetune-multi-gpu-single-node/finetune.sky.yaml -y
+
+name: skyspot-finetune-multinode-single
+
+# Relative to where you invoke sky, so launch from the REPO ROOT (see README).
+workdir: recipes/02-finetune-multi-gpu-single-node
+
+num_nodes: 1
+
+resources:
+  # 8 GPUs on one node. g7e=RTXPRO6000 (96GB x8), g6=L4 (24GB x8), g5=A10G (24GB x8).
+  accelerators: {RTXPRO6000:8, L4:8, A10G:8}
+  use_spot: true
+  # Per-node spot cap (USD/hr) for an 8-GPU box. Tune to budget.
+  max_hourly_cost: 20.0
+  any_of:
+    - {cloud: aws, region: eu-north-1}
+    - {cloud: aws, region: ap-south-1}
+    - {cloud: aws, region: us-east-1}
+  job_recovery:
+    strategy: EAGER_NEXT_REGION
+
+# Region-suffixed buckets resolved at runtime (see recipe 01 for the rationale).
+# Set BUCKET_PREFIX to the name_prefix you deployed with infra/data.
+envs:
+  MODEL_NAME: Qwen/Qwen3.5-4B
+  BUCKET_PREFIX: skyspot
+  # infra/data/init-data.sh uploads the sample dataset to "dolly/train.jsonl".
+  DATA_FILE: dolly/train.jsonl
+
+setup: |
+  pip install -q --index-url https://download.pytorch.org/whl/cu128 torch
+  pip install -q transformers peft datasets accelerate
+  command -v aws >/dev/null 2>&1 || pip install -q awscli
+
+run: |
+  nvidia-smi
+  # --- Resolve the region we landed in and the region-local bucket names. ---
+  TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+  REGION=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/placement/region)
+  ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+  TRAIN_BUCKET="${BUCKET_PREFIX}-training-${ACCOUNT}-${REGION}"
+  WEIGHTS_BUCKET="${BUCKET_PREFIX}-weights-${ACCOUNT}-${REGION}"
+  echo "Region=${REGION}  train=s3://${TRAIN_BUCKET}  weights=s3://${WEIGHTS_BUCKET}"
+
+  # /data and /outputs are at the filesystem root; sky run: is a non-root user, so
+  # create them with sudo and hand ownership over (sky nodes have passwordless sudo).
+  sudo mkdir -p /data /outputs && sudo chown "$(id -u):$(id -g)" /data /outputs
+  if [ -n "${DATA_FILE}" ]; then
+    aws s3 sync "s3://${TRAIN_BUCKET}" /data --only-show-errors
+  fi
+  ( while true; do aws s3 sync /outputs "s3://${WEIGHTS_BUCKET}" --only-show-errors; sleep 120; done ) &
+  SYNC_PID=$!
+
+  # Shared run id so every rank writes to the same S3 output prefix.
+  export SKYSPOT_RUN_ID=$(date +%Y%m%d-%H%M%S)
+  # Data-parallel across every GPU on the node. SKYPILOT_NUM_GPUS_PER_NODE is set
+  # by SkyPilot to the GPU count of whichever instance was provisioned (8 here).
+  torchrun --standalone --nproc_per_node=$SKYPILOT_NUM_GPUS_PER_NODE train.py; rc=$?
+
+  kill "$SYNC_PID" 2>/dev/null || true
+  aws s3 sync /outputs "s3://${WEIGHTS_BUCKET}" --only-show-errors
+  echo "Weights in s3://${WEIGHTS_BUCKET}/runs/"
+  exit $rc
+
+# Trained weights land in: s3://<your weights bucket>/runs/<run-id>/

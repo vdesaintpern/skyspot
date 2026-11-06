@@ -1,0 +1,31 @@
+#!/bin/bash
+# SkySpot jumpbox bootstrap: install the sky CLI and write the direct-SSH config.
+set -eux
+
+# SkyPilot in an isolated venv. The box needs ~4 GB RAM: it keeps a SkyPilot API
+# server resident while `sky jobs launch` waits for provisioning. Hence t3.medium.
+python3 -m venv /opt/sky
+/opt/sky/bin/pip install --upgrade pip
+/opt/sky/bin/pip install "skypilot[aws]"
+
+# Put sky on PATH for interactive SSM sessions (ssm-user and root).
+echo 'export PATH=/opt/sky/bin:$PATH' > /etc/profile.d/sky.sh
+
+# SkyPilot config: private IPs + DIRECT SSH (use_ssm: false is the key line).
+mkdir -p /root/.sky
+cat > /root/.sky/config.yaml <<'CFG'
+aws:
+  vpc_name: ${vpc_name}
+  use_internal_ips: true
+  use_ssm: false
+jobs:
+  controller:
+    resources:
+      cloud: aws
+      region: ${region}
+serve:
+  controller:
+    resources:
+      cloud: aws
+      region: ${region}
+CFG

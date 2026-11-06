@@ -1,0 +1,95 @@
+# Recipe 01 - single-GPU LoRA fine-tune on spot.
+#
+# One GPU, cheapest-first across g7e / g6 / g5 in three regions, price-capped,
+# auto-failover to the next region on preemption or stockout. Training data is
+# read from an existing S3 bucket; weights are written to an S3 bucket so they
+# survive a spot preemption.
+#
+# Launch:
+#   sky jobs launch -n ft-single recipes/01-finetune-single-gpu/finetune.sky.yaml -y
+#   sky jobs queue          # watch state
+#   sky jobs logs ft-single # tail logs
+
+name: skyspot-finetune-single
+
+# Uploaded to the GPU node and used as the working dir for setup/run. Path is
+# relative to where you invoke sky, so launch from the REPO ROOT (see README).
+# Pointing at just this folder keeps the upload tiny (no .venv/.git/other recipes).
+workdir: recipes/01-finetune-single-gpu
+
+resources:
+  # "Any of these GPUs" - SkyPilot picks the cheapest available. All three are
+  # single-GPU here: g7e=RTXPRO6000 (96GB), g6=L4 (24GB), g5=A10G (24GB).
+  accelerators: {RTXPRO6000:1, L4:1, A10G:1}
+  use_spot: true
+  # Per-node spot price cap (USD/hr). Tune to your budget; jobs above this are
+  # not launched. Set comfortably above g7e single-GPU spot so it stays eligible.
+  max_hourly_cost: 2.0
+  # Candidate regions. SkyPilot skips any region without capacity. Keep this list
+  # in sync with where you deployed VPCs (infra/vpc) + data (infra/data-replication).
+  any_of:
+    - {cloud: aws, region: eu-north-1}
+    - {cloud: aws, region: ap-south-1}
+    - {cloud: aws, region: us-east-1}
+  # On preemption/stockout, eagerly try the next region instead of waiting.
+  job_recovery:
+    strategy: EAGER_NEXT_REGION
+
+# ------------------------------------------------------------------ data + weights
+# Buckets are REGION-SUFFIXED (<prefix>-training|weights-<account>-<region>) so this
+# job works in whichever region it lands in. Rather than a static file_mounts bucket
+# (which would pin one region), the run: script below resolves the region at runtime
+# and reads/writes the LOCAL bucket. The training data is replicated into every
+# region by infra/data-replication (CRR); outputs are written to that region's
+# weights bucket. Set BUCKET_PREFIX to the name_prefix you deployed with infra/data.
+envs:
+  MODEL_NAME: Qwen/Qwen3.5-4B
+  BUCKET_PREFIX: skyspot
+  # Path (under /data) to a JSONL file with {"instruction","input","output"} rows.
+  # infra/data/init-data.sh uploads the sample dataset to "dolly/train.jsonl".
+  # Leave empty to run on a public demo dataset instead (no bucket needed).
+  DATA_FILE: dolly/train.jsonl
+
+setup: |
+  # cu128 PyTorch wheels run on Blackwell (g7e), Ada (g6) and Ampere (g5), so one
+  # setup covers every GPU this recipe can land on. Modern torch is numpy-2 clean,
+  # which avoids the old numpy<2 / pyarrow pinning conflict.
+  pip install -q --index-url https://download.pytorch.org/whl/cu128 torch
+  pip install -q transformers peft datasets accelerate
+  # AWS CLI is used to sync the region-local S3 buckets (see run:).
+  command -v aws >/dev/null 2>&1 || pip install -q awscli
+
+run: |
+  nvidia-smi
+  # --- Resolve the region we actually landed in, and the local bucket names. ---
+  TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+  REGION=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/placement/region)
+  ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+  TRAIN_BUCKET="${BUCKET_PREFIX}-training-${ACCOUNT}-${REGION}"
+  WEIGHTS_BUCKET="${BUCKET_PREFIX}-weights-${ACCOUNT}-${REGION}"
+  echo "Region=${REGION}  train=s3://${TRAIN_BUCKET}  weights=s3://${WEIGHTS_BUCKET}"
+
+  # /data and /outputs are at the filesystem root; sky run: is a non-root user, so
+  # create them with sudo and hand ownership over (sky nodes have passwordless sudo).
+  sudo mkdir -p /data /outputs && sudo chown "$(id -u):$(id -g)" /data /outputs
+  # Pull training data from the region-local bucket (replicated by CRR).
+  if [ -n "${DATA_FILE}" ]; then
+    aws s3 sync "s3://${TRAIN_BUCKET}" /data --only-show-errors
+  fi
+  # Stream outputs to S3 in the background so a spot preemption keeps finished work.
+  ( while true; do aws s3 sync /outputs "s3://${WEIGHTS_BUCKET}" --only-show-errors; sleep 120; done ) &
+  SYNC_PID=$!
+
+  python train.py; rc=$?
+
+  # Final flush of outputs to the region-local weights bucket, then exit with the
+  # training exit code so a failed run is reported as FAILED (not SUCCEEDED).
+  kill "$SYNC_PID" 2>/dev/null || true
+  aws s3 sync /outputs "s3://${WEIGHTS_BUCKET}" --only-show-errors
+  echo "Weights in s3://${WEIGHTS_BUCKET}/runs/"
+  exit $rc
+
+# Trained weights land in: s3://<your weights bucket>/runs/<run-id>/
+# (printed at the end of the job log).

@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.claude
+# SkyPilot / run artifacts
+logs/
+*.log
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+crash.log
+*.tfvars
+!example.tfvars
+tmp
+multiregion-test-report.md

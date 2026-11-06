@@ -1,0 +1,96 @@
+# Recipe 04 - serve a large LLM (zai-org/GLM-5.3) across TWO nodes on spot.
+#
+# GLM-5.3 is ~1.5 TB in BF16 - too big for a single 8-GPU node here - so each
+# SkyServe replica is a 2-node cluster of 8x H200 (p5en.48xlarge) joined by EFA.
+# vLLM runs over a Ray cluster that SkyPilot builds across the nodes:
+#   - tensor parallel   = 8   (GPUs per node, within each node)
+#   - pipeline parallel = 2   (number of nodes, across the spine)
+# Capacity: 2 x (8 x 141 GB H200) = ~2.26 TB, enough for the ~1.5 TB weights plus
+# KV cache and activation headroom.
+#
+# Per requirement this recipe does NOT use G instances - it uses Hopper H200
+# (p5en), which has the GPU memory and the EFA fabric a model this size needs.
+#
+# Deploy:
+#   sky serve up -n glm recipes/04-serve-large-llm-multinode/serve.sky.yaml
+#   sky serve status glm
+
+name: skyspot-serve-glm
+
+service:
+  # A ~1.5 TB model takes a long time to download and load across two nodes, far
+  # longer than the 1200s default readiness window. Without this raise, SkyServe
+  # fails a perfectly healthy replica mid-load (FAILED_INITIAL_DELAY). 2h is
+  # deliberately generous for a first, uncached load; lower it once you know yours.
+  readiness_probe:
+    path: /v1/models
+    initial_delay_seconds: 7200
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 1
+    # Spot-first with an on-demand safety net. Losing a multi-node spot replica
+    # mid-serve is very disruptive, so the fallback matters more here than for the
+    # small model. Set false for pure spot. NOTE: the on-demand fallback uses your
+    # separate on-demand P quota (often 0 until you request an increase).
+    dynamic_ondemand_fallback: true
+
+resources:
+  # 8x H200 per node => p5en.48xlarge (H200 = 141 GB/GPU, 192 vCPU/node).
+  # To widen spot capacity you may ALSO allow B200 (also a valid 2-node fit at
+  # 2 x 1.5 TB and available in more regions): accelerators: {H200:8, B200:8}.
+  # Do NOT add B300 here - it needs only 1 node, a different num_nodes, so it
+  # belongs in its own single-node recipe, not this 2-node one.
+  accelerators: {H200:8}
+  use_spot: true
+  # Each node caches the full model repo before loading its shard, so the boot
+  # disk must hold the whole ~1.5 TB download with headroom. The default volume is
+  # far too small and the download dies with "No space left on device". Size this
+  # to your model: roughly (weights size) + 25%.
+  disk_size: 2000
+  # Per-NODE spot cap (USD/hr). p5en.48xlarge spot runs roughly $15-40/node in
+  # these regions (US regions far higher). The 2-node replica costs up to ~2x
+  # this. Raise if replicas stay PENDING (no capacity under the cap); lower to be
+  # stricter on cost.
+  max_hourly_cost: 40.0
+  network_tier: best      # EFA / best inter-node fabric ("same spine" bandwidth)
+  ports: 8000
+  # H200 (p5en) is offered in all three standard regions. You need a SkySpot VPC in
+  # each region kept here (see infra/vpc). Both nodes of a replica land in ONE
+  # region (same VPC; EFA needs the same AZ / placement group), so this recipe needs
+  # no cross-region peering - unlike the managed-job recipes (01/02), whose
+  # controller reaches a failed-over worker across regions.
+  any_of:
+    - {cloud: aws, region: eu-north-1}
+    - {cloud: aws, region: ap-south-1}
+    - {cloud: aws, region: us-east-1}
+
+# Each replica spans 2 nodes: 2 x (8x H200) = 16 GPUs, ~2.26 TB total, for
+# GLM-5.3's ~1.5 TB BF16 weights plus KV cache / activation headroom.
+num_nodes: 2
+
+envs:
+  MODEL_NAME: zai-org/GLM-5.3
+  # HF_TOKEN: <your token>   # if the model is gated
+
+setup: |
+  pip install -q vllm ray
+
+run: |
+  # SkyPilot sets these across the replica's nodes.
+  HEAD_IP=$(echo "$SKYPILOT_NODE_IPS" | head -n1)
+
+  if [ "$SKYPILOT_NODE_RANK" == "0" ]; then
+    # Ray head + the vLLM server live on node 0.
+    ray start --head --disable-usage-stats --port=6379
+    sleep 15
+    vllm serve $MODEL_NAME \
+      --host 0.0.0.0 --port 8000 \
+      --trust-remote-code \
+      --tensor-parallel-size $SKYPILOT_NUM_GPUS_PER_NODE \
+      --pipeline-parallel-size $SKYPILOT_NUM_NODES
+  else
+    # Worker node joins the Ray cluster and stays up.
+    sleep 15
+    ray start --address "$HEAD_IP:6379" --disable-usage-stats
+    sleep infinity
+  fi
